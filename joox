@@ -1,0 +1,1417 @@
+/**
+ * MusicFree 插件 · JOOX 音乐（QQ 音乐海外版）
+ * ------------------------------------------------------------
+ * 双通道实现：
+ *  - 搜索 / 播放 / 歌词：apicx.asia 的 joox_music 接口
+ *      支持 low / standard / high / super 四档音质
+ *      （MP3 128 → MP3 320 → 无损 FLAC → Hi-Res / 母带）
+ *  - 榜单 / 歌单：微信音乐 App 协议（smusic.app.wechat.com）
+ *      国内网络可直连，含榜单、歌单分类、歌单详情、歌单搜索
+ *  - 播放 / 歌词失败时自动降级到微信音乐协议
+ *  - 缓存：播放地址 5 分钟，列表 10 分钟
+ *
+ * 安装：MusicFree → 侧边栏「插件」→ 右上角「+」→ 从文件安装 / 从 URL 安装
+ * 说明：接口 token 已内置；若失效，可在插件设置里填入自己的 token
+ * ------------------------------------------------------------
+ */
+
+const axios = require("axios");
+
+const API_BASE = "https://apicx.asia/api/joox_music";
+const DEFAULT_TOKEN = "rABFQ0Xn2sTm-zwGLM8Buw";
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+// 播放地址有效期有限，缓存 5 分钟
+const CACHE_TTL = 5 * 60 * 1000;
+const DETAIL_CACHE = Object.create(null);
+const LIST_CACHE = Object.create(null);
+const LIST_CACHE_TTL = 10 * 60 * 1000;
+
+// 音质降级链：按用户选择的音质，依次尝试可用的最高档
+const QUALITY_CHAIN = {
+  low: ["MP3 128", "AAC 96", "AAC 48", "OGG 192"],
+  standard: ["MP3 320", "OGG 320", "AAC 192", "MP3 128"],
+  high: ["无损FLAC", "MP3 320"],
+  super: ["Hi-Res无损", "母带无损", "Atmos全景声", "无损FLAC", "MP3 320"],
+};
+
+/* ============================================================
+ * 一、环境变量 / 基础工具
+ * ============================================================ */
+
+function readVars() {
+  try {
+    if (
+      typeof env !== "undefined" &&
+      env &&
+      typeof env.getUserVariables === "function"
+    ) {
+      return env.getUserVariables() || {};
+    }
+  } catch (e) {
+    // 忽略：旧版本或无 env
+  }
+  return {};
+}
+
+function readToken() {
+  const vars = readVars();
+  const token = vars.token ? String(vars.token).replace(/\s+/g, "") : "";
+  return token || DEFAULT_TOKEN;
+}
+
+function buildUrl(params) {
+  const parts = [];
+  Object.keys(params).forEach(function (key) {
+    const value = params[key];
+    if (value === undefined || value === null || value === "") return;
+    parts.push(encodeURIComponent(key) + "=" + encodeURIComponent(value));
+  });
+  return API_BASE + "?" + parts.join("&");
+}
+
+async function request(params) {
+  const url = buildUrl(params);
+  const res = await axios.get(url, {
+    headers: {
+      "User-Agent": UA,
+      Referer: "https://www.joox.com/",
+    },
+    timeout: 5000,
+  });
+  let data = res ? res.data : null;
+  if (typeof data === "string") {
+    try {
+      data = JSON.parse(data);
+    } catch (e) {
+      data = null;
+    }
+  }
+  return data || {};
+}
+
+function decodeEntities(text) {
+  return String(text === undefined || text === null ? "" : text)
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .trim();
+}
+
+function normalize(text) {
+  return decodeEntities(text)
+    .replace(/[（(\[【].*?[）)\]】]/g, "")
+    .replace(/[\s\-_·・,，、/&+]/g, "")
+    .toLowerCase();
+}
+
+function mainArtist(artist) {
+  const raw = decodeEntities(artist);
+  if (!raw) return "";
+  return raw.split(/[,，、/&]|feat\.?/i)[0].trim();
+}
+
+function parseDuration(text) {
+  if (text === undefined || text === null || text === "") return 0;
+  if (typeof text === "number") return Math.round(text);
+  const parts = String(text).trim().split(":");
+  if (parts.length >= 2) {
+    const min = parseInt(parts[0], 10) || 0;
+    const sec = parseInt(parts[1], 10) || 0;
+    return min * 60 + sec;
+  }
+  const n = parseInt(text, 10);
+  return isNaN(n) ? 0 : n;
+}
+
+/* ============================================================
+ * 二、Base64 / UTF-8
+ * ============================================================ */
+
+const B64_CHARS =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function utf8Bytes(str) {
+  const out = [];
+  const s = String(str);
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) {
+      out.push(c);
+    } else if (c < 0x800) {
+      out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+    } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      const c2 = s.charCodeAt(i + 1);
+      if (c2 >= 0xdc00 && c2 <= 0xdfff) {
+        const cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+        out.push(
+          0xf0 | (cp >> 18),
+          0x80 | ((cp >> 12) & 63),
+          0x80 | ((cp >> 6) & 63),
+          0x80 | (cp & 63)
+        );
+        i++;
+      } else {
+        out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      }
+    } else {
+      out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    }
+  }
+  return out;
+}
+
+function utf8Decode(bytes) {
+  let out = "";
+  let i = 0;
+  while (i < bytes.length) {
+    const c = bytes[i++];
+    if (c < 0x80) {
+      out += String.fromCharCode(c);
+    } else if (c < 0xc0) {
+      out += "\uFFFD";
+    } else if (c < 0xe0) {
+      out += String.fromCharCode(((c & 31) << 6) | (bytes[i++] & 63));
+    } else if (c < 0xf0) {
+      out += String.fromCharCode(
+        ((c & 15) << 12) | ((bytes[i++] & 63) << 6) | (bytes[i++] & 63)
+      );
+    } else {
+      let cp =
+        ((c & 7) << 18) |
+        ((bytes[i++] & 63) << 12) |
+        ((bytes[i++] & 63) << 6) |
+        (bytes[i++] & 63);
+      cp -= 0x10000;
+      out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 1023));
+    }
+  }
+  return out;
+}
+
+function base64ToBytes(input) {
+  const lookup = {};
+  for (let i = 0; i < B64_CHARS.length; i++) lookup[B64_CHARS.charAt(i)] = i;
+
+  const str = String(input).replace(/[^A-Za-z0-9+/=]/g, "");
+  const bytes = [];
+  for (let i = 0; i < str.length; i += 4) {
+    const e1 = lookup[str.charAt(i)];
+    const e2 = lookup[str.charAt(i + 1)];
+    const e3 = lookup[str.charAt(i + 2)];
+    const e4 = lookup[str.charAt(i + 3)];
+    if (e1 === undefined) break;
+    bytes.push((e1 << 2) | ((e2 || 0) >> 4));
+    if (e3 !== undefined) bytes.push(((e2 & 15) << 4) | (e3 >> 2));
+    if (e4 !== undefined) bytes.push(((e3 & 3) << 6) | e4);
+  }
+  return bytes;
+}
+
+function bytesToBase64(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b1 = bytes[i];
+    const b2 = i + 1 < bytes.length ? bytes[i + 1] : null;
+    const b3 = i + 2 < bytes.length ? bytes[i + 2] : null;
+    out += B64_CHARS.charAt(b1 >> 2);
+    out += B64_CHARS.charAt(((b1 & 3) << 4) | (b2 === null ? 0 : b2 >> 4));
+    out +=
+      b2 === null
+        ? "="
+        : B64_CHARS.charAt(((b2 & 15) << 2) | (b3 === null ? 0 : b3 >> 6));
+    out += b3 === null ? "=" : B64_CHARS.charAt(b3 & 63);
+  }
+  return out;
+}
+
+function b64En(text) {
+  return bytesToBase64(utf8Bytes(String(text === undefined ? "" : text)));
+}
+
+// 微信音乐接口的文本字段是 base64(utf8)；遇到明文则原样返回
+function b64Text(value) {
+  if (value === undefined || value === null) return "";
+  const raw = String(value).trim();
+  if (!raw) return "";
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(raw) || raw.length % 4 !== 0) return raw;
+  const decoded = utf8Decode(base64ToBytes(raw));
+  if (!decoded || decoded.indexOf("\uFFFD") >= 0) return raw;
+  for (let i = 0; i < decoded.length; i++) {
+    const code = decoded.charCodeAt(i);
+    if (code < 32 && code !== 9 && code !== 10 && code !== 13) return raw;
+  }
+  return decoded;
+}
+
+/* ============================================================
+ * 三、纯 JS 解压（微信音乐接口返回 gzip / zlib 压缩数据）
+ * ============================================================ */
+
+const _LBASE = [
+  3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67,
+  83, 99, 115, 131, 163, 195, 227, 258,
+];
+const _LEXT = [
+  0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5,
+  5, 5, 5, 0,
+];
+const _DBASE = [
+  1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513,
+  769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+];
+const _DEXT = [
+  0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10,
+  11, 11, 12, 12, 13, 13,
+];
+const _CLORDER = [
+  16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
+let _fixedLit = null;
+let _fixedDist = null;
+
+function _buildTree(lengths) {
+  const count = new Array(16).fill(0);
+  for (let i = 0; i < lengths.length; i++) count[lengths[i]]++;
+  count[0] = 0;
+  const offs = new Array(16).fill(0);
+  for (let i = 1; i < 16; i++) offs[i] = offs[i - 1] + count[i - 1];
+  const symbols = new Array(lengths.length).fill(-1);
+  for (let i = 0; i < lengths.length; i++) {
+    if (lengths[i]) symbols[offs[lengths[i]]++] = i;
+  }
+  return { count: count, symbols: symbols };
+}
+
+function _decodeSym(br, tree) {
+  let code = 0;
+  let first = 0;
+  let index = 0;
+  for (let len = 1; len <= 15; len++) {
+    code |= br.bit();
+    const c = tree.count[len];
+    if (code - first < c) return tree.symbols[index + (code - first)];
+    index += c;
+    first = (first + c) << 1;
+    code <<= 1;
+  }
+  return -1;
+}
+
+function _inflateBlock(br, litTree, distTree, out) {
+  for (;;) {
+    let sym = _decodeSym(br, litTree);
+    if (!(sym >= 0)) throw new Error("bad lit code");
+    if (sym < 256) {
+      out.push(sym);
+      continue;
+    }
+    if (sym === 256) return;
+    sym -= 257;
+    if (sym < 0 || sym >= _LBASE.length) throw new Error("bad len code");
+    const len = _LBASE[sym] + br.bits(_LEXT[sym]);
+    const dsym = _decodeSym(br, distTree);
+    if (!(dsym >= 0) || dsym >= _DBASE.length) throw new Error("bad dist code");
+    const dist = _DBASE[dsym] + br.bits(_DEXT[dsym]);
+    if (dist > out.length) throw new Error("dist too far");
+    const start = out.length - dist;
+    for (let i = 0; i < len; i++) out.push(out[start + i]);
+  }
+}
+
+function _fixedTrees() {
+  if (!_fixedLit) {
+    const lit = [];
+    for (let i = 0; i < 144; i++) lit.push(8);
+    for (let i = 144; i < 256; i++) lit.push(9);
+    for (let i = 256; i < 280; i++) lit.push(7);
+    for (let i = 280; i < 288; i++) lit.push(8);
+    _fixedLit = _buildTree(lit);
+    _fixedDist = _buildTree(new Array(32).fill(5));
+  }
+}
+
+function _inflate(bytes, startPos) {
+  const br = {
+    p: startPos,
+    buf: 0,
+    cnt: 0,
+    bit: function () {
+      if (this.cnt === 0) {
+        this.buf = this.p < bytes.length ? bytes[this.p++] : 0;
+        this.cnt = 8;
+      }
+      const b = this.buf & 1;
+      this.buf >>= 1;
+      this.cnt--;
+      return b;
+    },
+    bits: function (n) {
+      let v = 0;
+      for (let i = 0; i < n; i++) v |= this.bit() << i;
+      return v;
+    },
+    align: function () {
+      this.cnt = 0;
+    },
+    byte: function () {
+      return this.p < bytes.length ? bytes[this.p++] : 0;
+    },
+  };
+
+  const out = [];
+  for (;;) {
+    const bfinal = br.bit();
+    const btype = br.bits(2);
+    if (btype === 0) {
+      br.align();
+      const len = br.byte() | (br.byte() << 8);
+      br.byte();
+      br.byte();
+      for (let i = 0; i < len; i++) out.push(br.byte());
+    } else if (btype === 1) {
+      _fixedTrees();
+      _inflateBlock(br, _fixedLit, _fixedDist, out);
+    } else if (btype === 2) {
+      const hlit = br.bits(5) + 257;
+      const hdist = br.bits(5) + 1;
+      const hclen = br.bits(4) + 4;
+      const clLens = new Array(19).fill(0);
+      for (let i = 0; i < hclen; i++) clLens[_CLORDER[i]] = br.bits(3);
+      const clTree = _buildTree(clLens);
+      const lengths = [];
+      while (lengths.length < hlit + hdist) {
+        const sym = _decodeSym(br, clTree);
+        if (!(sym >= 0)) throw new Error("bad cl code");
+        if (sym < 16) {
+          lengths.push(sym);
+        } else if (sym === 16) {
+          if (!lengths.length) throw new Error("no prev len");
+          const prev = lengths[lengths.length - 1];
+          const rep = 3 + br.bits(2);
+          for (let i = 0; i < rep; i++) lengths.push(prev);
+        } else if (sym === 17) {
+          const rep = 3 + br.bits(3);
+          for (let i = 0; i < rep; i++) lengths.push(0);
+        } else {
+          const rep = 11 + br.bits(7);
+          for (let i = 0; i < rep; i++) lengths.push(0);
+        }
+      }
+      _inflateBlock(
+        br,
+        _buildTree(lengths.slice(0, hlit)),
+        _buildTree(lengths.slice(hlit, hlit + hdist)),
+        out
+      );
+    } else {
+      throw new Error("bad block type");
+    }
+    if (bfinal) break;
+  }
+  return out;
+}
+
+function gunzipBytes(bytes) {
+  let start = -1;
+  for (let i = 0; i + 2 < bytes.length && i < 64; i++) {
+    if (bytes[i] === 0x1f && bytes[i + 1] === 0x8b && bytes[i + 2] === 0x08) {
+      start = i;
+      break;
+    }
+  }
+  if (start < 0) throw new Error("gzip magic not found");
+
+  const flg = bytes[start + 3];
+  let p = start + 10;
+  if (flg & 0x04) {
+    const xlen = bytes[p] | (bytes[p + 1] << 8);
+    p += 2 + xlen;
+  }
+  if (flg & 0x08) {
+    while (p < bytes.length && bytes[p++] !== 0);
+  }
+  if (flg & 0x10) {
+    while (p < bytes.length && bytes[p++] !== 0);
+  }
+  if (flg & 0x02) p += 2;
+  return utf8Decode(_inflate(bytes, p));
+}
+
+/* ============================================================
+ * 四、微信音乐 App 协议网络层
+ * ============================================================ */
+
+const WX_HOSTS = [
+  "https://smusic.app.wechat.com",
+  "http://smusic.app.wechat.com",
+];
+const WX_UDID = "ffffffffafc29b1f0000019e74b3c5af";
+const WX_CV = 0x21000201;
+const WX_DEFAULTS = {
+  uid: "UnknownUserId",
+  udid: WX_UDID,
+  OpenUDID: WX_UDID,
+  OpenUDID2: WX_UDID,
+  sid: "0",
+  v: WX_CV,
+  cv: WX_CV,
+  ct: 11,
+  os_ver: 15,
+  phonetype: "RMX5010",
+  chid: 0,
+  mcc: "",
+  mnc: "",
+  country: "CN",
+  backend_country: "hk",
+  lang: "zh_CN",
+  wmid: 0,
+  usertype: 10,
+};
+
+let _wxHostIdx = 0;
+
+function buildWxBody(extra) {
+  const data = {};
+  Object.keys(WX_DEFAULTS).forEach(function (key) {
+    data[key] = WX_DEFAULTS[key];
+  });
+  Object.keys(extra || {}).forEach(function (key) {
+    data[key] = extra[key];
+  });
+
+  let xml = '<?xml version="1.0" encoding="UTF-8"?><root>';
+  Object.keys(data).forEach(function (key) {
+    xml += "<" + key + ">" + data[key] + "</" + key + ">";
+  });
+  return xml + "</root>";
+}
+
+function toBytes(data) {
+  if (!data) return null;
+  if (typeof Uint8Array !== "undefined" && data instanceof Uint8Array) {
+    return data;
+  }
+  if (typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer) {
+    return new Uint8Array(data);
+  }
+  if (
+    typeof Buffer !== "undefined" &&
+    Buffer.isBuffer &&
+    Buffer.isBuffer(data)
+  ) {
+    return new Uint8Array(data);
+  }
+  // React Native 中二进制可能被序列化成 { type: "Buffer", data: [...] }
+  if (data && data.type === "Buffer" && data.data) {
+    return new Uint8Array(data.data);
+  }
+  // 跨 realm 的 Buffer / TypedArray：按类数组处理
+  if (data && typeof data === "object" && typeof data.length === "number") {
+    const arr = new Uint8Array(data.length);
+    for (let i = 0; i < data.length; i++) arr[i] = data[i] & 255;
+    return arr;
+  }
+  if (data && typeof data === "object" && typeof data.byteLength === "number") {
+    return new Uint8Array(data);
+  }
+  return null;
+}
+
+function trimProtocol(text) {
+  let idx = -1;
+  ["<", "{", "["].forEach(function (ch) {
+    const p = text.indexOf(ch);
+    if (p >= 0 && (idx < 0 || p < idx)) idx = p;
+  });
+  return idx > 0 ? text.slice(idx) : text;
+}
+
+function decodeWxResponse(data) {
+  if (data === undefined || data === null) return "";
+  if (typeof data === "string") return trimProtocol(data);
+
+  const bytes = toBytes(data);
+  if (!bytes) return String(data);
+
+  for (let i = 0; i + 2 < bytes.length && i < 64; i++) {
+    if (bytes[i] === 0x1f && bytes[i + 1] === 0x8b && bytes[i + 2] === 0x08) {
+      try {
+        return trimProtocol(gunzipBytes(bytes));
+      } catch (e) {
+        // 继续尝试 zlib
+      }
+    }
+  }
+  for (let i = 0; i + 1 < bytes.length && i < 64; i++) {
+    if (bytes[i] === 0x78 && (0x7800 + bytes[i + 1]) % 31 === 0) {
+      try {
+        return trimProtocol(utf8Decode(_inflate(bytes, i + 2)));
+      } catch (e) {
+        // 落到明文解析
+      }
+    }
+  }
+  return trimProtocol(utf8Decode(bytes));
+}
+
+async function wxFetch(path, body) {
+  const payload = buildWxBody(body);
+  const headers = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    Accept: "*/*",
+    "Accept-Encoding": "identity",
+    "User-Agent": "WeChatMusic " + WX_CV + "(android 15)",
+  };
+
+  const base = _wxHostIdx % WX_HOSTS.length;
+  const plans = [
+    { host: WX_HOSTS[base], rt: "arraybuffer" },
+    { host: WX_HOSTS[(base + 1) % WX_HOSTS.length], rt: "arraybuffer" },
+  ];
+
+  let lastErr = null;
+  for (let i = 0; i < plans.length; i++) {
+    try {
+      const res = await axios.post(plans[i].host + path, payload, {
+        responseType: plans[i].rt,
+        timeout: 7000,
+        headers: headers,
+        validateStatus: function () {
+          return true;
+        },
+      });
+      _wxHostIdx = (base + i) % WX_HOSTS.length;
+      const text = decodeWxResponse(res ? res.data : null);
+      if (text) return text;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw new Error(
+    "JOOX 榜单/歌单接口请求失败：" +
+      (lastErr && lastErr.message ? lastErr.message : "无响应")
+  );
+}
+
+async function wxJson(path, body) {
+  const text = await wxFetch(path, body);
+  const start = text.indexOf("{");
+  if (start < 0) throw new Error("JOOX 接口返回格式异常");
+  try {
+    return JSON.parse(text.slice(start)) || {};
+  } catch (e) {
+    throw new Error("JOOX 接口返回解析失败");
+  }
+}
+
+async function wxJsonCached(key, path, body, ttl) {
+  const hit = LIST_CACHE[key];
+  if (hit && Date.now() - hit.time < (ttl || LIST_CACHE_TTL)) return hit.data;
+  const data = await wxJson(path, body);
+  LIST_CACHE[key] = { time: Date.now(), data: data };
+  return data;
+}
+
+/* ============================================================
+ * 五、简易 XML 解析（部分接口返回 XML）
+ * ============================================================ */
+
+function xmlInnerText(text) {
+  return decodeEntities(text);
+}
+
+function xmlFirst(xml, tag) {
+  const m = String(xml || "").match(
+    new RegExp("<" + tag + "(?:\\s[^>]*)?>([\\s\\S]*?)</" + tag + ">")
+  );
+  return m ? m[1] : "";
+}
+
+function pdfh(xml, rule) {
+  const parts = String(rule).split("&&");
+  if (parts[parts.length - 1] === "Text") parts.pop();
+  let cur = xml;
+  for (let i = 0; i < parts.length; i++) cur = xmlFirst(cur, parts[i]);
+  return xmlInnerText(cur);
+}
+
+/* ============================================================
+ * 六、数据映射
+ * ============================================================ */
+
+const WX_QUALITY_FILE = {
+  low: { s: "M500", e: ".mp3" },
+  standard: { s: "M800", e: ".mp3" },
+  high: { s: "F000", e: ".flac" },
+  super: { s: "RS01", e: ".flac" },
+};
+const WX_QUALITY_ORDER = ["super", "high", "standard", "low"];
+
+function parseQualities(raw) {
+  const out = {};
+  try {
+    const map = JSON.parse(raw || "{}") || {};
+    if (map["128"]) out.low = { size: map["128"] };
+    if (map["320"]) out.standard = { size: map["320"] };
+    if (map["flac"]) out.high = { size: map["flac"] };
+    if (map["hires"] || map["master_tape"]) {
+      out.super = { size: map["hires"] || map["master_tape"] };
+    }
+  } catch (e) {
+    // 忽略：无 kbps_map 时按请求音质尝试
+  }
+  return out;
+}
+
+function pickWxQuality(item, quality) {
+  const quals = item.qualities || {};
+  if (quals[quality]) return quality;
+  const idx = WX_QUALITY_ORDER.indexOf(quality);
+  if (idx < 0) return "standard";
+  for (let i = idx + 1; i < WX_QUALITY_ORDER.length; i++) {
+    if (quals[WX_QUALITY_ORDER[i]]) return WX_QUALITY_ORDER[i];
+  }
+  for (let j = idx - 1; j >= 0; j--) {
+    if (quals[WX_QUALITY_ORDER[j]]) return WX_QUALITY_ORDER[j];
+  }
+  return quality;
+}
+
+function wxSongToItem(song) {
+  const mid = String(song.songmid || "");
+  const sid = String(song.songid || "");
+  const title = b64Text(song.songname);
+  let artist = b64Text(song.singername);
+  if (!artist && song.singer_list && song.singer_list.length) {
+    artist = song.singer_list
+      .map(function (s) {
+        return b64Text(s && s.name);
+      })
+      .filter(Boolean)
+      .join(" / ");
+  }
+
+  return {
+    id: mid || sid,
+    title: title,
+    artist: artist,
+    album: b64Text(song.albumname),
+    artwork: song.album_url || "",
+    duration: parseDuration(song.playtime),
+    mid: mid,
+    songmid: mid,
+    songId: sid,
+    needExact: true,
+    keyword: artist ? title + " " + mainArtist(artist) : title,
+    qualities: parseQualities(song.kbps_map),
+  };
+}
+
+function picFromTemplate(tpl, size) {
+  if (!tpl) return "";
+  return String(tpl).replace("%d", String(size || 300));
+}
+
+function wxSheetToItem(sheet) {
+  const img =
+    sheet.picurl ||
+    picFromTemplate(sheet.pic_url_tpl, 300) ||
+    sheet.bigpic ||
+    "";
+  return {
+    id: "sheet:" + sheet.id,
+    sheetId: String(sheet.id),
+    title: b64Text(sheet.title || sheet.name || sheet.singername),
+    artwork: img,
+    description: sheet.modifytime ? "更新于 " + sheet.modifytime : "",
+  };
+}
+
+function wxTopToItem(top) {
+  const img =
+    top.PicUrl ||
+    top.SmallPicUrl ||
+    picFromTemplate(top.pic_url_tpl, 300) ||
+    "";
+  return {
+    id: "top:" + top.RecID,
+    topId: String(top.RecID),
+    title: b64Text(top.RecName),
+    artwork: img,
+    description:
+      b64Text(top.description) ||
+      (top.UpdateTime ? "更新于 " + top.UpdateTime : ""),
+    worksNum: Number(top.SubNum) || undefined,
+  };
+}
+
+/* ============================================================
+ * 七、apicx 搜索与歌曲详情
+ * ============================================================ */
+
+function pickLinks(detail) {
+  return (detail && detail["播放链接"]) || null;
+}
+
+function hasPlayableLink(detail) {
+  const links = pickLinks(detail);
+  if (!links) return false;
+  const keys = Object.keys(links);
+  for (let i = 0; i < keys.length; i++) {
+    const value = links[keys[i]];
+    if (value && String(value).length > 10) return true;
+  }
+  return false;
+}
+
+function splitArtists(artist) {
+  const raw = decodeEntities(artist);
+  if (!raw) return [];
+  return raw
+    .split(/[,，、/&]|feat\.?/i)
+    .map(function (name) {
+      return normalize(name);
+    })
+    .filter(Boolean);
+}
+
+// 最长公共子序列占比，用于兼容简繁 / 细微标题差异
+function textSimilarity(a, b) {
+  const n = a.length;
+  const m = b.length;
+  if (!n || !m) return 0;
+  if (a === b) return 1;
+  let prev = new Array(m + 1);
+  let cur = new Array(m + 1);
+  for (let j = 0; j <= m; j++) prev[j] = 0;
+  for (let i = 1; i <= n; i++) {
+    cur[0] = 0;
+    const ca = a.charAt(i - 1);
+    for (let j = 1; j <= m; j++) {
+      cur[j] =
+        ca === b.charAt(j - 1)
+          ? prev[j - 1] + 1
+          : prev[j] > cur[j - 1]
+          ? prev[j]
+          : cur[j - 1];
+    }
+    const tmp = prev;
+    prev = cur;
+    cur = tmp;
+  }
+  return prev[m] / Math.max(n, m);
+}
+
+function isSameSong(item, detail) {
+  if (!detail) return false;
+  const targetMid = String(item.songmid || "").toLowerCase();
+  const detailMid = String(detail.songmid || "").toLowerCase();
+  if (targetMid && detailMid && targetMid === detailMid) return true;
+
+  const t1 = normalize(item.title);
+  const t2 = normalize(detail["歌曲名称"]);
+  if (!t1 || !t2) return false;
+
+  // 标题允许简繁差异：长度接近且相似度够高即视为同一首
+  const titleOk =
+    t1 === t2 ||
+    (Math.abs(t1.length - t2.length) <= 2 && textSimilarity(t1, t2) >= 0.75);
+  if (!titleOk) return false;
+
+  const list1 = splitArtists(item.artist);
+  const list2 = splitArtists(detail["歌手"]);
+  if (!list1.length || !list2.length) return true;
+  for (let i = 0; i < list1.length; i++) {
+    for (let j = 0; j < list2.length; j++) {
+      if (list1[i] === list2[j] || textSimilarity(list1[i], list2[j]) >= 0.7) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+async function fetchDetailByKeyword(keyword, index) {
+  try {
+    const json = await request({
+      token: readToken(),
+      msg: keyword,
+      n: index || 1,
+    });
+    if (json && json.code == 200 && json.data && hasPlayableLink(json.data)) {
+      return json.data;
+    }
+  } catch (e) {
+    // 单次尝试失败不抛出，交给上层换关键词重试
+  }
+  return null;
+}
+
+/**
+ * 获取歌曲详情（含播放地址、歌词），带缓存与多级兜底
+ * strict 为 true 时只接受歌名/歌手（或 songmid）匹配的结果
+ */
+async function fetchDetail(musicItem, strict) {
+  const cacheKey = String((musicItem && musicItem.id) || "");
+  const cached = cacheKey ? DETAIL_CACHE[cacheKey] : null;
+  if (cached && Date.now() - cached.time < CACHE_TTL) return cached.data;
+
+  const title = decodeEntities(musicItem.title);
+  const artist = mainArtist(musicItem.artist);
+  const attempts = [];
+
+  if (title) {
+    attempts.push({ keyword: artist ? title + " " + artist : title, index: 1 });
+  }
+  if (musicItem.keyword && musicItem.indexInSearch) {
+    attempts.push({
+      keyword: String(musicItem.keyword),
+      index: parseInt(musicItem.indexInSearch, 10) || 1,
+    });
+  }
+  if (title && artist) {
+    attempts.push({ keyword: title, index: 1 });
+  }
+
+  let fallback = null;
+  let matched = false;
+  const tried = Object.create(null);
+  const startedAt = Date.now();
+
+  for (let i = 0; i < attempts.length; i++) {
+    // 沙箱单次调用 10 秒超时，多级兜底时控制总耗时
+    if (i > 0 && Date.now() - startedAt > 6000) break;
+
+    const tryKey = attempts[i].keyword + "#" + attempts[i].index;
+    if (tried[tryKey]) continue;
+    tried[tryKey] = true;
+
+    const detail = await fetchDetailByKeyword(
+      attempts[i].keyword,
+      attempts[i].index
+    );
+    if (!detail) continue;
+    if (isSameSong(musicItem, detail)) {
+      fallback = detail;
+      matched = true;
+      break;
+    }
+    if (!fallback && !strict) fallback = detail;
+  }
+
+  if (!fallback || (strict && !matched)) {
+    throw new Error("JOOX 未找到可用音源，请更换关键词或稍后重试");
+  }
+
+  if (cacheKey) {
+    DETAIL_CACHE[cacheKey] = { time: Date.now(), data: fallback };
+  }
+  return fallback;
+}
+
+/* ============================================================
+ * 八、搜索
+ * ============================================================ */
+
+async function searchMusic(query, page) {
+  const keyword = String(query || "").trim();
+  // 接口不支持翻页（一次返回全部结果），第二页起直接结束
+  if (!keyword || page > 1) {
+    return { isEnd: true, data: [] };
+  }
+
+  let json;
+  try {
+    json = await request({ token: readToken(), msg: keyword });
+  } catch (e) {
+    throw new Error("JOOX 搜索请求失败：" + (e && e.message ? e.message : e));
+  }
+
+  const payload = json ? json.data : null;
+  const songs = payload
+    ? payload.songs || (Array.isArray(payload) ? payload : [])
+    : [];
+
+  const data = [];
+  songs.forEach(function (it, i) {
+    if (!it) return;
+    const title = decodeEntities(it["歌曲名称"]);
+    if (!title) return;
+    const songmid = String(it.songmid || "");
+    const songId = String(it["歌曲ID"] || "");
+    data.push({
+      id: songmid || songId || "joox_" + i,
+      title: title,
+      artist: decodeEntities(it["歌手"]),
+      album: decodeEntities(it["专辑"]),
+      duration: parseDuration(it["时长"]),
+      artwork: "",
+      songmid: songmid,
+      songId: songId,
+      keyword: keyword,
+      indexInSearch: parseInt(it["序号"], 10) || i + 1,
+    });
+  });
+
+  // 去重：同一首歌常因不同专辑 / 歌手顺序重复出现，按「歌名 + 歌手集合」只保留最靠前的一条
+  const seen = Object.create(null);
+  const unique = [];
+  data.forEach(function (item) {
+    const key =
+      normalize(item.title) + "|" + splitArtists(item.artist).sort().join(",");
+    if (seen[key]) return;
+    seen[key] = true;
+    unique.push(item);
+  });
+
+  return { isEnd: true, data: unique };
+}
+
+async function searchSheets(query, page) {
+  const keyword = String(query || "").trim();
+  const current = Math.max(1, Number(page) || 1);
+  if (!keyword) return { isEnd: true, data: [] };
+
+  const size = 30;
+  const json = await wxJson("/fcgi-bin/category_search", {
+    cid: 10041,
+    music: b64En(keyword),
+    type: 3,
+    sin: (current - 1) * size,
+    ein: current * size,
+  });
+
+  const list = json.result || [];
+  return {
+    isEnd: (Number(json.sum) || 0) <= current * size || !list.length,
+    data: list.map(wxSheetToItem),
+  };
+}
+
+/* ============================================================
+ * 九、播放地址 / 歌词 / 歌曲信息
+ * ============================================================ */
+
+async function mediaFromSearch(musicItem, quality) {
+  const detail = await fetchDetail(
+    musicItem,
+    !!(musicItem.needExact || musicItem.mid)
+  );
+  const links = pickLinks(detail);
+  if (!links) throw new Error("JOOX 未返回播放地址");
+
+  const chain = QUALITY_CHAIN[quality] || QUALITY_CHAIN.standard;
+  let url = "";
+  for (let i = 0; i < chain.length; i++) {
+    const candidate = links[chain[i]];
+    if (candidate && String(candidate).length > 10) {
+      url = String(candidate);
+      break;
+    }
+  }
+
+  if (!url) {
+    const keys = Object.keys(links);
+    for (let i = 0; i < keys.length; i++) {
+      if (links[keys[i]]) {
+        url = String(links[keys[i]]);
+        break;
+      }
+    }
+  }
+
+  if (!url) throw new Error("JOOX 暂无可用播放地址（可能受版权限制）");
+
+  return {
+    url: url.replace(/^http:\/\//i, "https://"),
+    quality: quality || "standard",
+    headers: {
+      "User-Agent": UA,
+      Referer: "https://www.joox.com/",
+    },
+  };
+}
+
+// 微信音乐协议兜底：按 mid + 音质拼文件名，换取临时 vkey
+function wxQualityOrder(start) {
+  const idx = WX_QUALITY_ORDER.indexOf(start);
+  if (idx < 0) return ["standard", "low"];
+  return WX_QUALITY_ORDER.slice(idx);
+}
+
+// 微信音乐接口会返回多个 CDN server，但并非每个都能取到该 vkey
+async function wxExpressUrls(mid, quality) {
+  const file = WX_QUALITY_FILE[quality] || WX_QUALITY_FILE.standard;
+  const filename = file.s + mid + file.e;
+
+  const xml = await wxFetch("/fcgi-bin/music_express", {
+    cid: 352,
+    authst: "",
+    qq: 0,
+    guid: "0",
+    nettype: 1020,
+    musicname: filename,
+  });
+
+  const vkey = decodeEntities(pdfh(xml, "vkey&&Text"));
+  if (!vkey) return [];
+
+  const servers = [];
+  const re = /<server>\s*(https?:\/\/[^<\s]+)\s*<\/server>/gi;
+  let match;
+  while ((match = re.exec(xml))) {
+    const host = match[1].replace(/\s+/g, "");
+    if (servers.indexOf(host) < 0) servers.push(host);
+  }
+
+  const urls = [];
+  servers.slice(0, 2).forEach(function (host) {
+    // 优先 https，部分 CDN 不支持再回落到 http
+    if (/^http:\/\//i.test(host)) {
+      urls.push(
+        host.replace(/^http:\/\//i, "https://") +
+          filename +
+          "?vkey=" +
+          vkey +
+          "&guid=0"
+      );
+    }
+    urls.push(host + filename + "?vkey=" + vkey + "&guid=0");
+  });
+  return urls;
+}
+
+// 校验地址是否真的能取到音频，避免把 401/404 的地址交给播放器
+async function isPlayableUrl(url) {
+  try {
+    const res = await axios.head(url, {
+      headers: {
+        "User-Agent": UA,
+        Referer: "https://www.joox.com/",
+      },
+      timeout: 3000,
+      validateStatus: function () {
+        return true;
+      },
+    });
+    const status = res ? Number(res.status) : 0;
+    if (!status) return true;
+    if (status === 405 || status === 501) return true; // 不支持 HEAD，交给播放器判断
+    return status >= 200 && status < 400;
+  } catch (e) {
+    return true; // 网络层异常不作为地址无效
+  }
+}
+
+async function mediaFromWx(musicItem, quality) {
+  const mid = musicItem.mid || musicItem.songmid;
+  if (!mid) throw new Error("JOOX 暂无可用的备用音源");
+
+  const startQuality = pickWxQuality(musicItem, quality || "standard");
+  const order = wxQualityOrder(startQuality);
+  let lastErr = null;
+
+  for (let i = 0; i < order.length; i++) {
+    let urls = [];
+    try {
+      urls = await wxExpressUrls(mid, order[i]);
+    } catch (e) {
+      lastErr = e;
+      continue;
+    }
+
+    for (let j = 0; j < urls.length; j++) {
+      if (await isPlayableUrl(urls[j])) {
+        return {
+          url: urls[j],
+          quality: order[i],
+          headers: {
+            "User-Agent": UA,
+            Referer: "https://www.joox.com/",
+          },
+        };
+      }
+    }
+    lastErr = new Error("JOOX 播放地址不可用（" + order[i] + "）");
+  }
+
+  throw lastErr || new Error("JOOX 暂无可用播放地址（可能受版权限制）");
+}
+
+async function getMediaSource(musicItem, quality) {
+  let primary = null;
+  try {
+    primary = await mediaFromSearch(musicItem, quality);
+    if (await isPlayableUrl(primary.url)) return primary;
+  } catch (e) {
+    // 搜索接口失败或无版权，走备用通道
+  }
+
+  try {
+    return await mediaFromWx(musicItem, quality);
+  } catch (e) {
+    if (primary) return primary;
+    throw e;
+  }
+}
+
+async function getLyric(musicItem) {
+  try {
+    const detail = await fetchDetail(
+      musicItem,
+      !!(musicItem.needExact || musicItem.mid)
+    );
+    const lrc = detail ? detail["歌词内容"] || detail.lyric : "";
+    if (lrc) return { rawLrc: String(lrc) };
+  } catch (e) {
+    // 搜索接口失败时走微信音乐协议
+  }
+
+  const gl = musicItem.songId || musicItem.id;
+  if (gl) {
+    try {
+      const xml = await wxFetch("/fcgi-bin/3g_lyric", {
+        cid: 111,
+        gt: 1,
+        gl: gl,
+        music: b64En(musicItem.title),
+        singer: b64En(musicItem.artist),
+        album: b64En(musicItem.album),
+      });
+      const lrc = b64Text(pdfh(xml, "txt&&Text"));
+      if (lrc) return { rawLrc: lrc };
+    } catch (e) {
+      // 忽略，统一抛出无歌词
+    }
+  }
+
+  throw new Error("JOOX 暂无该歌曲歌词");
+}
+
+async function getMusicInfo(musicItem) {
+  try {
+    const detail = await fetchDetail(
+      musicItem,
+      !!(musicItem.needExact || musicItem.mid)
+    );
+    return {
+      title: decodeEntities(detail["歌曲名称"]) || musicItem.title,
+      artist: decodeEntities(detail["歌手"]) || musicItem.artist,
+      album: decodeEntities(detail["专辑"]) || musicItem.album,
+      duration: parseDuration(detail["时长"]) || musicItem.duration,
+      songmid: String(detail.songmid || musicItem.songmid || ""),
+      songId: String(detail["歌曲ID"] || musicItem.songId || ""),
+    };
+  } catch (e) {
+    return {};
+  }
+}
+
+/* ============================================================
+ * 十、榜单
+ * ============================================================ */
+
+async function getTopLists() {
+  const json = await wxJsonCached("toplist", "/fcgi-bin/get_toplist", {
+    cid: 293,
+  });
+  const groups = json.Group || [];
+
+  const result = [];
+  groups.forEach(function (group) {
+    const list = (group.List || []).map(wxTopToItem);
+    if (!list.length) return;
+    result.push({
+      title: b64Text(group.GroupName) || "排行榜",
+      data: list,
+    });
+  });
+
+  if (!result.length) {
+    throw new Error("JOOX 榜单暂无数据，请稍后重试");
+  }
+  return result;
+}
+
+async function getTopListDetail(topListItem, page) {
+  const current = Math.max(1, Number(page) || 1);
+  const topId =
+    (topListItem && topListItem.topId) ||
+    String((topListItem && topListItem.id) || "").replace(/^top:/, "");
+
+  if (!topId) throw new Error("JOOX 榜单参数缺失");
+
+  const json = await wxJsonCached(
+    "topdetail:" + topId,
+    "/fcgi-bin/fcg_mv_rank",
+    {
+      cid: 283,
+      authst: "",
+      itemid: topId,
+      typeid: 10005,
+      cmd: "getsonginfo",
+      sin: 0,
+      pagesize: 100,
+    }
+  );
+
+  const all = (json.songlist || []).map(wxSongToItem);
+  const size = 30;
+  const start = (current - 1) * size;
+
+  return {
+    isEnd: start + size >= all.length,
+    musicList: all.slice(start, start + size),
+    topListItem: topListItem,
+  };
+}
+
+/* ============================================================
+ * 十一、歌单
+ * ============================================================ */
+
+async function getRecommendSheetTags() {
+  const json = await wxJsonCached("taglist", "/fcgi-bin/tag_list", {
+    cid: 720,
+  });
+
+  const pinned = [{ id: "0", title: "综合推荐" }];
+  (json.feature || []).forEach(function (item) {
+    if (!item || item.tag_id === undefined) return;
+    pinned.push({ id: String(item.tag_id), title: b64Text(item.name) });
+  });
+
+  const data = [];
+  (json.category || []).forEach(function (category) {
+    const tags = (category.itemlist || []).map(function (item) {
+      return { id: String(item.tag_id), title: b64Text(item.name) };
+    });
+    if (!tags.length) return;
+    data.push({ title: b64Text(category.name) || "分类", data: tags });
+  });
+
+  if (!data.length) {
+    throw new Error("JOOX 歌单分类暂无数据，请稍后重试");
+  }
+  return { pinned: pinned, data: data };
+}
+
+async function getRecommendSheetsByTag(tag, page) {
+  const current = Math.max(1, Number(page) || 1);
+  const size = 30;
+
+  const json = await wxJson("/fcgi-bin/recommend_more", {
+    cid: 30,
+    sin: (current - 1) * size,
+    ein: current * size,
+    req_type: 5,
+    tab: 1,
+    tag_id: tag && tag.id ? String(tag.id) : "0",
+  });
+
+  const list = (json.itemlist || []).map(wxSheetToItem);
+  return {
+    isEnd: (Number(json.count) || 0) <= current * size || !list.length,
+    data: list,
+  };
+}
+
+async function getMusicSheetInfo(sheetItem, page) {
+  const current = Math.max(1, Number(page) || 1);
+  const sheetId =
+    (sheetItem && sheetItem.sheetId) ||
+    String((sheetItem && sheetItem.id) || "").replace(/^sheet:/, "");
+
+  if (!sheetId) throw new Error("JOOX 歌单参数缺失");
+
+  const json = await wxJson("/fcgi-bin/3g_get_diss", {
+    cid: 287,
+    authst: "",
+    wmid: 0,
+    opType: 2,
+    qryDissID: sheetId,
+    orderFromTo: 0,
+    qtyUin: 0,
+    hostUin: 0,
+    dirID: 0,
+    meta_ver: 0,
+    detail_ver: 0,
+  });
+
+  const all = (json.songlist || []).map(wxSongToItem);
+  const size = 30;
+  const start = (current - 1) * size;
+
+  return {
+    isEnd: start + size >= all.length,
+    musicList: all.slice(start, start + size),
+    sheetItem: {
+      id: (sheetItem && sheetItem.id) || "sheet:" + sheetId,
+      sheetId: sheetId,
+      title: b64Text(json.title) || (sheetItem && sheetItem.title) || "",
+      artwork:
+        json.picUrl ||
+        picFromTemplate(json.pic_url_tpl, 300) ||
+        (sheetItem && sheetItem.artwork) ||
+        "",
+      description:
+        b64Text(json.introduction) ||
+        (sheetItem && sheetItem.description) ||
+        "",
+      worksNum: all.length || undefined,
+    },
+  };
+}
+
+/* ============================================================
+ * 十二、插件导出
+ * ============================================================ */
+
+module.exports = {
+  platform: "JOOX",
+  version: "1.2.1",
+  author: "诗酒趁年华『威』",
+  description:
+    "JOOX（QQ 音乐海外版）曲库，支持榜单、歌单、最高 Hi-Res 无损与时间轴歌词",
+  cacheControl: "no-cache",
+  supportedSearchType: ["music", "sheet"],
+  userVariables: [
+    {
+      key: "token",
+      name: "接口 Token（可选）",
+      hint: "内置 token 失效时，可填入 apicx.asia 账号的 token 覆盖",
+    },
+  ],
+  hints: {
+    search: [
+      "支持「歌名」「歌手」「歌名 + 歌手」搜索",
+      "接口单次最多返回约 20 条结果，结果不准确时可加上歌手名再搜",
+      "搜索类型切换为「歌单」可按关键词搜 JOOX 歌单",
+    ],
+    getTopLists: [
+      "榜单与歌单走微信音乐通道，国内网络可直连，每页 30 首",
+      "播放时优先走高音质搜索，失败会自动切到微信音乐通道",
+    ],
+    getMusicSheetInfo: [
+      "歌单按 JOOX 编辑分类浏览，点开即可查看全部歌曲",
+      "歌单条目播放时优先走搜索接口取高音质，VIP 歌曲可能只有试听",
+    ],
+  },
+  async search(query, page, type) {
+    if (type === "sheet") return await searchSheets(query, page);
+    if (type !== "music") return { isEnd: true, data: [] };
+    return await searchMusic(query, page);
+  },
+  getMediaSource: getMediaSource,
+  getLyric: getLyric,
+  getMusicInfo: getMusicInfo,
+  getTopLists: getTopLists,
+  getTopListDetail: getTopListDetail,
+  getRecommendSheetTags: getRecommendSheetTags,
+  getRecommendSheetsByTag: getRecommendSheetsByTag,
+  getMusicSheetInfo: getMusicSheetInfo,
+};
