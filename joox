@@ -10,6 +10,18 @@
  *  - 播放 / 歌词失败时自动降级到微信音乐协议
  *  - 缓存：播放地址 5 分钟，列表 10 分钟
  *
+ * v1.3.0 封面加载提速（对齐 JOOX-V3.7 的封面方案）：
+ *  - 根因：微信音乐协议里歌曲封面字段 album_url 直接给的是
+ *    image.joox.com/JOOXcover/.../1000 的 1000px 原图（实测单张 34KB~470KB，
+ *    平均约 250KB，图床首字节还要 1~1.5s），一页 30 首就是数 MB，
+ *    App 端并发受限，封面只能一张张"挤"出来
+ *  - 统一收敛到 300px 缩略图（实测单张 13KB~40KB，约 25KB，体积降约 90%），
+ *    服务端仅支持 300 / 500 / 1000 三档，300 已实测全量可用
+ *  - 新增 normalizeCover：base64 字段解码、HTML 实体、%d 模板统一替换、
+ *    协议相对补全、http→https（Android 拦截明文图）、去掉 URL 里的空白
+ *  - 封面字段多路探测（album_url/albumurl/albumMid/picurl/pic_url_tpl…），
+ *    列表页与详情页对同一张封面得到同一个 URL，命中图片缓存不再重复下载
+ *
  * 安装：MusicFree → 侧边栏「插件」→ 右上角「+」→ 从文件安装 / 从 URL 安装
  * 说明：接口 token 已内置；若失效，可在插件设置里填入自己的 token
  * ------------------------------------------------------------
@@ -245,6 +257,87 @@ function b64Text(value) {
     if (code < 32 && code !== 9 && code !== 10 && code !== 13) return raw;
   }
   return decoded;
+}
+
+/* ============================================================
+ * 二·补、封面地址归一化（v1.3 封面提速）
+ * ------------------------------------------------------------
+ * JOOX 图床实测：
+ *  - image.joox.com/JOOXcover/.../<尺寸>   仅支持 300 / 500 / 1000，
+ *    1000 单张 34~470KB（平均约 250KB），300 单张 13~40KB（平均约 25KB）
+ *  - cos.image.joox.com/...jpeg/300        只有 300 可用（500/1000 直接失败）
+ *  - imgcache.joox.com/.../toplist_300/... 只有 300 可用（150/600 均 404）
+ * 所以所有封面一律收敛到 300，绝不使用 1000 原图。
+ * ============================================================ */
+
+const COVER_SIZE = 300;
+
+function isUrlLike(text) {
+  return /^(?:https?:)?\/\//i.test(String(text || ""));
+}
+
+// 少数字段会把封面地址做 base64（标准 / URL-safe 两种都可能）
+function decodeCoverValue(value) {
+  const compact = String(value || "").replace(/\s+/g, "");
+  if (!compact || compact.length < 16) return "";
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(compact)) return "";
+  let std = compact.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+  const pad = (4 - (std.length % 4)) % 4;
+  if (pad) std += "====".slice(0, pad);
+  const decoded = utf8Decode(base64ToBytes(std));
+  return isUrlLike(decoded) ? decoded : "";
+}
+
+// 只对 JOOX 自家图床动尺寸，避免误伤其它站点带数字的路径
+function shrinkCoverSize(url) {
+  // image.joox.com / cos.image.joox.com：末尾路径段就是尺寸
+  let u = url.replace(
+    /^(https:\/\/(?:cos\.)?image\.joox\.com\/[^?#]+?)\/\d{2,4}(\?[^#]*)?$/i,
+    function (_m, base, query) {
+      return base + "/" + COVER_SIZE + (query || "");
+    }
+  );
+  // imgcache.joox.com：photo_hk/toplist_300、album_500 这类「_尺寸」路径段
+  u = u.replace(
+    /^(https:\/\/imgcache\.joox\.com\/.*?_)\d{2,4}(\/[^?#]*)?(\?[^#]*)?$/i,
+    function (_m, base, rest, query) {
+      return base + COVER_SIZE + (rest || "") + (query || "");
+    }
+  );
+  return u;
+}
+
+function normalizeCover(value) {
+  let url = String(value === undefined || value === null ? "" : value).trim();
+  if (!url) return "";
+
+  if (!isUrlLike(url)) {
+    const decoded = decodeCoverValue(url);
+    if (decoded) url = decoded;
+  }
+
+  // HTML 实体 + 字段里混入的换行/空格（RN 直接当 URL 用会 400）
+  url = decodeEntities(url).replace(/[\r\n\t ]/g, "");
+
+  // 模板占位：pic_url_tpl 形如 .../toplist_%d/....jpg、...jpeg/%d（可能有多个）
+  if (/%d/i.test(url)) url = url.replace(/%d/gi, String(COVER_SIZE));
+
+  if (/^\/\//.test(url)) url = "https:" + url;
+  url = url.replace(/^http:\/\//i, "https://"); // Android 默认拦明文图
+  if (!/^https:\/\//i.test(url)) return "";
+
+  url = shrinkCoverSize(url);
+  // 已编码的地址不重复编码（重复编码会让 %2F 变成 %252F 导致 404）
+  return /%[0-9a-f]{2}/i.test(url) ? url : encodeURI(url);
+}
+
+// 按优先级挑第一个能用的封面字段
+function pickCover(candidates) {
+  for (let i = 0; i < candidates.length; i++) {
+    const url = normalizeCover(candidates[i]);
+    if (url) return url;
+  }
+  return "";
 }
 
 /* ============================================================
@@ -700,7 +793,22 @@ function wxSongToItem(song) {
     title: title,
     artist: artist,
     album: b64Text(song.albumname),
-    artwork: song.album_url || "",
+    /* v1.3: 封面多路探测 + 统一收敛到 300 缩略图（album_url 原为 .../1000 原图） */
+    artwork: pickCover([
+      song.album_url,
+      song.albumurl,
+      song.albumUrl,
+      song.album_pic,
+      song.albumPic,
+      song.picurl,
+      song.picUrl,
+      song.cover,
+      song.cover_url,
+      song.coverUrl,
+      song.albummid, // JOOX 协议中该字段有时直接就是封面 URL
+      song.albumMid,
+      song.artwork,
+    ]),
     duration: parseDuration(song.playtime),
     mid: mid,
     songmid: mid,
@@ -713,15 +821,21 @@ function wxSongToItem(song) {
 
 function picFromTemplate(tpl, size) {
   if (!tpl) return "";
-  return String(tpl).replace("%d", String(size || 300));
+  // v1.3: 全局替换（旧版只换第一个 %d，多占位模板会留下坏地址）
+  return String(tpl).replace(/%d/gi, String(size || COVER_SIZE));
 }
 
 function wxSheetToItem(sheet) {
-  const img =
-    sheet.picurl ||
-    picFromTemplate(sheet.pic_url_tpl, 300) ||
-    sheet.bigpic ||
-    "";
+  const img = pickCover([
+    sheet.picurl,
+    sheet.picUrl,
+    sheet.bigpic,
+    sheet.big_pic,
+    sheet.pic_url_tpl,
+    sheet.cover,
+    sheet.coverUrl,
+    sheet.artwork,
+  ]);
   return {
     id: "sheet:" + sheet.id,
     sheetId: String(sheet.id),
@@ -732,11 +846,15 @@ function wxSheetToItem(sheet) {
 }
 
 function wxTopToItem(top) {
-  const img =
-    top.PicUrl ||
-    top.SmallPicUrl ||
-    picFromTemplate(top.pic_url_tpl, 300) ||
-    "";
+  const img = pickCover([
+    top.PicUrl,
+    top.picurl,
+    top.SmallPicUrl,
+    top.pic_url_tpl,
+    top.bigpic,
+    top.cover,
+    top.artwork,
+  ]);
   return {
     id: "top:" + top.RecID,
     topId: String(top.RecID),
@@ -1353,11 +1471,14 @@ async function getMusicSheetInfo(sheetItem, page) {
       id: (sheetItem && sheetItem.id) || "sheet:" + sheetId,
       sheetId: sheetId,
       title: b64Text(json.title) || (sheetItem && sheetItem.title) || "",
-      artwork:
-        json.picUrl ||
-        picFromTemplate(json.pic_url_tpl, 300) ||
-        (sheetItem && sheetItem.artwork) ||
-        "",
+      /* v1.3: 与列表页走同一套归一化，命中同一张 300 缩略图（避免重复下载） */
+      artwork: pickCover([
+        json.picUrl,
+        json.picurl,
+        json.pic_url_tpl,
+        json.bigpic,
+        sheetItem && sheetItem.artwork,
+      ]),
       description:
         b64Text(json.introduction) ||
         (sheetItem && sheetItem.description) ||
@@ -1373,10 +1494,13 @@ async function getMusicSheetInfo(sheetItem, page) {
 
 module.exports = {
   platform: "JOOX",
-  version: "1.2.1",
+  version: "1.3.0",
   author: "诗酒趁年华『威』",
+  srcUrl: "https://raw.githubusercontent.com/sandy521741/lzw/refs/heads/main/joox",  
   description:
-    "JOOX（QQ 音乐海外版）曲库，支持榜单、歌单、最高 Hi-Res 无损与时间轴歌词",
+    "JOOX（QQ 音乐海外版）曲库，支持榜单、歌单、最高 Hi-Res 无损与时间轴歌词\n" +
+    "v1.3.0：封面提速——歌曲封面字段 album_url 原为 1000px 原图（单张约 250KB），" +
+    "统一收敛到 300px 缩略图（约 25KB，体积降约 90%），并补全 base64/%d 模板/http→https 归一化",
   cacheControl: "no-cache",
   supportedSearchType: ["music", "sheet"],
   userVariables: [
