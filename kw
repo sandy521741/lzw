@@ -89,11 +89,11 @@ function fixCover(pic) {
   if (pic.indexOf('//') === 0) return 'https:' + pic;
   return pic.replace(/^http:\/\//, 'https://');
 }
-/* 后端接口时长单位不统一（recSonglist 为毫秒、playlistSongList 为秒）：统一为毫秒 */
+/* 各接口（kuwo-proxy 歌单/榜单、kuwo-albuminfo 章节）实测均返回「秒」。
+   MusicFree 插件规范中 duration 单位也是「秒」，直接透传即可，切勿乘 1000，
+   否则 173 秒会变成 173000 被显示成 48:03:20 */
 function normalizeDuration(d) {
-  d = parseInt(d) || 0;
-  if (d > 0 && d < 30000) return d * 1000;
-  return d;
+  return parseInt(d) || 0;
 }
 function mapSong(s) {
   if (!s) return null;
@@ -269,9 +269,9 @@ async function fetchBangMenu() {
 module.exports = {
   platform: '酷我听书',
   author: '诗酒趁年华',
-  version: '1.3.0',
+  version: '1.3.1',
   /* 托管后填入本文件的 URL 即可开启在线更新，例如：srcUrl: 'https://example.com/lingting.js' */
-  srcUrl: 'https://raw.githubusercontent.com/sandy521741/lzw/refs/heads/main/kwts',
+  srcUrl: 'https://raw.githubusercontent.com/sandy521741/lzw/refs/heads/main/kw',
   primaryKey: ['id', 'rid'],
   cacheControl: 'no-cache',
   defaultSearchType: 'music',
@@ -347,7 +347,7 @@ module.exports = {
           artist: String(meta.author || sheetItem.artist || '未知主播'),
           album: String(meta.name || sheetItem.title || ''),
           artwork: artwork,
-          duration: (parseInt(ch.duration) || 0) * 1000,
+          duration: normalizeDuration(ch.duration),
         };
       });
       const result = { isEnd: start + PAGE_SIZE_CHAPTER >= chapters.length, musicList: musicList };
@@ -397,7 +397,7 @@ module.exports = {
         artist: String(meta.author || albumItem.artist || '未知作者'),
         album: String(meta.name || albumItem.title || ''),
         artwork: artwork,
-        duration: (parseInt(ch.duration) || 0) * 1000,
+        duration: normalizeDuration(ch.duration),
       };
     });
     const result = { isEnd: start + PAGE_SIZE_CHAPTER >= chapters.length, musicList: musicList };
